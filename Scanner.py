@@ -2,178 +2,235 @@
 
 import os
 import time
+import random
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import pandas as pd
 import yfinance as yf
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+
+import gspread
+from google.oauth2.service_account import Credentials
+from gspread.exceptions import WorksheetNotFound, APIError
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────────
-CSV_FILE               = os.path.expanduser("~/Desktop/SP500_updated.csv")
-OUTPUT_DIR             = os.path.expanduser("~/Desktop")
+CSV_FILE              = os.path.expanduser("~/Desktop/SP500_updated.csv")
+OUTPUT_DIR            = os.path.expanduser("~/Desktop")
+
+# Google Sheets settings
+SERVICE_ACCOUNT_FILE  = os.path.expanduser("~/Desktop/google-creds/scanner-465501-6c29eeebf51b.json")  # ← update this
+SPREADSHEET_ID        = "1IdGxKSh0_6HCoIzSYHHYrGDdfGiixtDA19zcVxqyZLA"                           # ← your Sheet ID
+WORKSHEET_NAME        = "Scanner"                                                             # ← your tab name
+
 # Default thresholds
 DEFAULT_MIN_MARKET_CAP = 500e6      # $500 million
 DEFAULT_MIN_AVG_VOLUME = 1e6        # 1 million shares/day
-DEFAULT_MAX_PCT        = 0.05       # within 5% of high
+DEFAULT_MAX_PCT        = 0.05       # within 5%
 
-# Email settings (configure these!)
-EMAIL_SENDER     = "trlm.scanner.bot@outlook.com"
-EMAIL_PASSWORD   = "Scannerbot2025"
-EMAIL_RECIPIENTS = ["erreazor@iu.edu"]
-SMTP_SERVER      = "smtp.mail.outlook.com"
-SMTP_PORT        = 587
-
-# Global thresholds (will be set by user input)
 MIN_MARKET_CAP = DEFAULT_MIN_MARKET_CAP
 MIN_AVG_VOLUME = DEFAULT_MIN_AVG_VOLUME
 MAX_PCT        = DEFAULT_MAX_PCT
 
-# ─── EMAIL FUNCTION ─────────────────────────────────────────────────────────────
-def send_email(subject, body):
-    """Attempt to send an email, catch and log any errors."""
-    try:
-        msg = MIMEMultipart()
-        msg['From']    = EMAIL_SENDER
-        msg['To']      = ", ".join(EMAIL_RECIPIENTS)
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'plain'))
-        # add timeout to SMTP connect
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as server:
-            server.starttls()
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.send_message(msg)
-        print(f"📧 Email sent to {', '.join(EMAIL_RECIPIENTS)}")
-    except Exception as e:
-        print(f"⚠️ Email failed: {e}")
+MAX_WORKERS    = 8
+SLEEP_INTERVAL = 1.0  # seconds
 
-# ─── FETCH INFO ─────────────────────────────────────────────────────────────────
-def fetch_info(ticker):
+
+def send_to_sheet(df: pd.DataFrame):
+    """Push DataFrame to Google Sheet and apply formatting & conditional rules."""
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds  = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
+    gc     = gspread.authorize(creds)
+
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    try:
+        ws = sh.worksheet(WORKSHEET_NAME)
+    except WorksheetNotFound:
+        ws = sh.add_worksheet(
+            title=WORKSHEET_NAME,
+            rows=str(len(df) + 1),
+            cols=str(len(df.columns))
+        )
+        print(f"➕ Created worksheet '{WORKSHEET_NAME}'")
+
+    # Write data
+    ws.clear()
+    rows = [df.columns.tolist()] + df.values.tolist()
+    ws.update(rows, value_input_option="USER_ENTERED")
+    print(f"📝 Pushed {len(df)} rows to Google Sheet '{WORKSHEET_NAME}'")
+
+    # Formatting parameters
+    sheet_id = ws.id
+    num_rows = len(df) + 1
+    num_cols = len(df.columns)
+    pct_idx  = df.columns.get_loc("PctToATH")
+
+    # 1) Apply banded range (if not exists)
+    banding_req = {
+        "addBanding": {
+            "bandedRange": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": num_rows,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": num_cols
+                },
+                "rowProperties": {
+                    "headerColor":     {"red": 0.8, "green": 0.8, "blue": 0.8},
+                    "firstBandColor":  {"red": 1.0, "green": 1.0, "blue": 1.0},
+                    "secondBandColor": {"red": 0.95,"green": 0.95,"blue": 0.95}
+                }
+            }
+        }
+    }
+    try:
+        ws.spreadsheet.batch_update({"requests": [banding_req]})
+        print("🎨 Applied banded table style")
+    except APIError as e:
+        if "already has alternating background colors" in e.response.text:
+            print("ℹ️ Banding already exists—skipping")
+        else:
+            raise
+
+    # 2) Other formatting & conditional rules
+    other_reqs = [
+        # freeze header row
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": sheet_id,
+                    "gridProperties": {"frozenRowCount": 1}
+                },
+                "fields": "gridProperties.frozenRowCount"
+            }
+        },
+        # highlight rows near ATH
+        {
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": num_rows,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": num_cols
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{
+                                "userEnteredValue":
+                                    f"=${chr(ord('A') + pct_idx)}2<={MAX_PCT}"
+                            }]
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 1.0, "green": 1.0, "blue": 0.0}
+                        }
+                    }
+                },
+                "index": 0
+            }
+        }
+    ]
+    ws.spreadsheet.batch_update({"requests": other_reqs})
+    print("🎨 Applied header freeze & highlights")
+
+
+def fetch_info(ticker: str):
+    """Fetch metrics with yfinance, including sector."""
     try:
         tk   = yf.Ticker(ticker)
         info = tk.info
+        sector = info.get("sector", "N/A")
         mc   = info.get("marketCap", 0)
         adv  = info.get("averageVolume", 0)
 
-        hist_full = tk.history(period="max")
-        ath       = hist_full["High"].max() if not hist_full.empty else None
+        hist = tk.history(period="max")
+        if hist.empty:
+            return None
 
-        hist52    = tk.history(period="52wk")
-        w52       = hist52["High"].max() if not hist52.empty else None
-
-        today_hist = tk.history(period="1d")
-        curr       = today_hist["Close"].iloc[-1] if not today_hist.empty else None
-
+        ath = hist["High"].max()
+        cutoff = (pd.Timestamp.now(tz=hist.index.tz) if hist.index.tz
+                  else pd.Timestamp.now()) - pd.Timedelta(days=365)
+        w52    = hist.loc[hist.index >= cutoff, "High"].max()
+        curr   = hist["Close"].iloc[-1]
         if None in (ath, w52, curr):
             return None
 
         return {
             "Ticker":      ticker,
+            "Sector":      sector,
             "Current":     curr,
             "AllTimeHigh": ath,
             "PctToATH":    (ath - curr) / ath,
             "52wHigh":     w52,
             "PctTo52w":    (w52  - curr) / w52,
             "MarketCap":   mc,
-            "AvgVolume":   adv,
+            "AvgVolume":   adv
         }
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ {ticker} fetch failed: {e}")
         return None
 
-# ─── SCAN, SAVE, FORMAT, EMAIL ─────────────────────────────────────────────────
+
 def scan_and_save():
-    # Load tickers
     df_sp = pd.read_csv(CSV_FILE)
-    possible = ["Ticker","ticker","Symbol","symbol","Code","code"]
-    ticker_col = next((c for c in df_sp.columns if c in possible), None)
+    ticker_col = next((c for c in df_sp.columns if c.lower() in ("ticker","symbol","code")), None)
     if not ticker_col:
-        print("❌ No ticker column found. Headers are:", df_sp.columns.tolist())
+        print("❌ No ticker column found. Headers:", df_sp.columns.tolist())
         return
 
     tickers = df_sp[ticker_col].dropna().astype(str).tolist()
     total   = len(tickers)
-
-    print(f"🔍 Scanning {total} tickers with presets:\n"
-          f"   • Min Market Cap: ${MIN_MARKET_CAP:,.0f}\n"
-          f"   • Min Avg Volume: {MIN_AVG_VOLUME:,.0f} shares/day\n"
-          f"   • Within {MAX_PCT*100:.2f}% of ATH or 52w High")
+    print(f"🔍 Scanning {total} tickers…")
 
     results = []
-    for i, t in enumerate(tickers, start=1):
-        print(f"[{i:>3}/{total}] {t}", end="\r", flush=True)
-        data = fetch_info(t.strip().upper())
-        time.sleep(0.3)
-        if not data:
-            continue
-        if (data["MarketCap"] >= MIN_MARKET_CAP and
-            data["AvgVolume"] >= MIN_AVG_VOLUME and
-            (data["PctToATH"] <= MAX_PCT or data["PctTo52w"] <= MAX_PCT)):
-            results.append(data)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_info, t): t for t in tickers}
+        for i, fut in enumerate(as_completed(futures), 1):
+            t = futures[fut]
+            data = fut.result()
+            time.sleep(SLEEP_INTERVAL + random.random())
+            print(f"[{i}/{total}] {t}", end="\r", flush=True)
+            if not isinstance(data, dict):
+                continue
+            if (
+                data["MarketCap"]  >= MIN_MARKET_CAP and
+                data["AvgVolume"]  >= MIN_AVG_VOLUME and
+                (data["PctToATH"]  <= MAX_PCT or data["PctTo52w"] <= MAX_PCT)
+            ):
+                results.append(data)
 
-    print(" " * 80, end="\r")  # clear progress line
-
+    print(" " * 80, end="\r")
     today = datetime.now().strftime("%Y%m%d")
     if not results:
         print("ℹ️ No matches today.")
-        send_email(f"Breakout Scan {today}", "No matches today.")
         return
 
-    # Build DataFrame
-    df_out = pd.DataFrame(results)[[
-        "Ticker","Current","AllTimeHigh","PctToATH",
-        "52wHigh","PctTo52w","MarketCap","AvgVolume"
-    ]].round(2)
+    df_out = pd.DataFrame(results)[
+        ["Ticker","Sector","Current","AllTimeHigh","PctToATH","52wHigh","PctTo52w","MarketCap","AvgVolume"]
+    ].round(2)
 
-    # 1) Save CSV
     csv_file = os.path.join(OUTPUT_DIR, f"scan_results_{today}.csv")
     df_out.to_csv(csv_file, index=False)
     print(f"✅ Wrote {len(df_out)} hits → {csv_file}")
 
-    # 2) Save Excel with highlight for All-Time High proximity
-    xlsx_file = os.path.join(OUTPUT_DIR, f"scan_results_{today}.xlsx")
-    with pd.ExcelWriter(xlsx_file, engine="xlsxwriter") as writer:
-        df_out.to_excel(writer, index=False, sheet_name="Scan")
-        wb  = writer.book
-        ws  = writer.sheets["Scan"]
-        fmt_yellow = wb.add_format({"bg_color": "#FFFF00"})
+    send_to_sheet(df_out)
 
-        start_row = 2
-        end_row   = len(df_out) + 1
-        cell_range = f"A{start_row}:H{end_row}"
-        ws.conditional_format(cell_range, {
-            "type":     "formula",
-            "criteria": f"=$D{start_row}<={MAX_PCT}",
-            "format":   fmt_yellow
-        })
-    print(f"✅ Wrote Excel with highlights → {xlsx_file}")
 
-    # 3) Email results
-    subject = f"Breakout Scan Results for {today}"
-    body    = df_out.to_string(index=False)
-    send_email(subject, body)
-
-# ─── MAIN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    inp = input(f"Market cap (want to use preset >500M type y): ")
-    if inp.lower() != 'y' and inp.strip() != '':
-        try:
-            MIN_MARKET_CAP = float(inp)
-        except ValueError:
-            print("Invalid input for market cap, using preset.")
+    inp = input("Market cap (preset >500M, type y): ")
+    if inp.lower() != 'y' and inp.strip():
+        try: MIN_MARKET_CAP = float(inp)
+        except: print("Invalid—using default.")
+    inp = input("Avg volume (preset >1M, type y): ")
+    if inp.lower() != 'y' and inp.strip():
+        try: MIN_AVG_VOLUME = float(inp)
+        except: print("Invalid—using default.")
+    inp = input("% from high (preset 0.05, type y): ")
+    if inp.lower() != 'y' and inp.strip():
+        try: MAX_PCT = float(inp)
+        except: print("Invalid—using default.")
 
-    inp = input(f"Avg volume (want to use preset >1M type y): ")
-    if inp.lower() != 'y' and inp.strip() != '':
-        try:
-            MIN_AVG_VOLUME = float(inp)
-        except ValueError:
-            print("Invalid input for avg volume, using preset.")
-
-    inp = input(f"% from high (want to use preset 0.05 type y): ")
-    if inp.lower() != 'y' and inp.strip() != '':
-        try:
-            MAX_PCT = float(inp)
-        except ValueError:
-            print("Invalid input for % from high, using preset.")
-
-    print("➡️ Running scan now …")
+    print("➡️ Running scan …")
     scan_and_save()
